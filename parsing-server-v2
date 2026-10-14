@@ -1,0 +1,1777 @@
+import socket
+import requests
+import threading
+import time
+import configparser
+import urllib3
+import os
+import sys
+
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+
+from requests.auth import HTTPBasicAuth
+from flask import Flask
+from pyais import decode
+from datetime import datetime, timezone
+
+
+# Path dan config
+BASE_DIR = (
+    os.path.dirname(sys.executable)
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
+)
+
+CONFIG_PATH = os.path.join(BASE_DIR, "setup.ini")
+
+config = configparser.ConfigParser()
+config.read(CONFIG_PATH)
+
+# Koneksi PostgreSQL
+DB_HOST = config.get("database", "host", fallback="localhost")
+DB_PORT = config.getint("database", "port", fallback=5432)
+DB_NAME = config.get("database", "name", fallback="collector")
+DB_USER = config.get("database", "user", fallback="postgres")
+DB_PASSWORD = config.get("database", "password", fallback="")
+
+
+# Konstanta
+BUFFER_SIZE = 4096
+
+FRAGMENT_TIMEOUT = 30
+IDLE_DATA_TIMEOUT = 60
+SOCKET_RECV_TIMEOUT = 10
+
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
+
+
+# Flask
+app = Flask(__name__)
+
+
+# Worker yang sedang berjalan
+adsb_workers = {}
+radio_workers = {}
+ais_workers = {}
+
+
+# Tipe pesan AIS
+VALID_MSG_TYPES = {
+    1,
+    2,
+    3,
+    4,
+    5,
+    18,
+    19,
+    24,
+}
+
+POSITION_MSG_TYPES = {
+    1,
+    2,
+    3,
+    4,
+    18,
+    19,
+}
+
+STATIC_MSG_TYPES = {
+    5,
+    24,
+}
+
+
+# Status navigasi
+NAV_STATUS = {
+    0: "Under way using engine",
+    1: "At anchor",
+    2: "Not under command",
+    3: "Restricted manoeuverability",
+    4: "Constrained by her draught",
+    5: "Moored",
+    6: "Aground",
+    7: "Engaged in fishing",
+    8: "Under way sailing",
+    9: "Reserved for future amendment",
+    10: "Reserved for future amendment",
+    11: "Reserved for future amendment",
+    12: "Reserved for future amendment",
+    13: "Reserved for future amendment",
+    14: "AIS-SART / MOB / EPIRB",
+    15: "Not defined",
+}
+
+
+# Tipe kapal
+SHIP_TYPE = {
+    0: "Not available",
+
+    20: "Wing in ground (WIG)",
+    21: "Wing in ground - reserved",
+    22: "Wing in ground - reserved",
+    23: "Wing in ground - reserved",
+    24: "Wing in ground - reserved",
+    25: "Wing in ground - reserved",
+    26: "Wing in ground - reserved",
+    27: "Wing in ground - reserved",
+    28: "Wing in ground - reserved",
+    29: "Wing in ground - reserved",
+
+    30: "Fishing",
+    31: "Towing",
+    32: "Towing (large)",
+    33: "Dredging / underwater ops",
+    34: "Diving ops",
+    35: "Military ops",
+    36: "Sailing",
+    37: "Pleasure craft",
+    38: "Reserved",
+    39: "Reserved",
+
+    40: "High speed craft (HSC)",
+    41: "HSC - Passenger",
+    42: "HSC - Cargo",
+    43: "HSC - Tender",
+    44: "HSC - Pleasure craft",
+    45: "HSC - Reserved",
+    46: "HSC - Reserved",
+    47: "HSC - Reserved",
+    48: "HSC - Reserved",
+    49: "HSC - No additional information",
+
+    50: "Pilot vessel",
+    51: "Search and rescue (SAR)",
+    52: "Tug",
+    53: "Port tender",
+    54: "Anti-pollution equipment",
+    55: "Law enforcement",
+    56: "Spare - local vessel",
+    57: "Spare - local vessel",
+    58: "Medical transport",
+    59: "Noncombatant ship",
+
+    60: "Passenger",
+    61: "Passenger - Hazardous category A",
+    62: "Passenger - Hazardous category B",
+    63: "Passenger - Hazardous category C",
+    64: "Passenger - Hazardous category D",
+    65: "Passenger - Other",
+    66: "Reserved",
+    67: "Reserved",
+    68: "Reserved",
+    69: "Passenger - No additional information",
+
+    70: "Cargo",
+    71: "Cargo - Hazardous category A",
+    72: "Cargo - Hazardous category B",
+    73: "Cargo - Hazardous category C",
+    74: "Cargo - Hazardous category D",
+    75: "Cargo - Other",
+    76: "Reserved",
+    77: "Reserved",
+    78: "Reserved",
+    79: "Cargo - No additional information",
+
+    80: "Tanker",
+    81: "Tanker - Hazardous category A",
+    82: "Tanker - Hazardous category B",
+    83: "Tanker - Hazardous category C",
+    84: "Tanker - Hazardous category D",
+    85: "Tanker - Other",
+    86: "Reserved",
+    87: "Reserved",
+    88: "Reserved",
+    89: "Tanker - No additional information",
+
+    90: "Other",
+    91: "Other - Hazardous category A",
+    92: "Other - Hazardous category B",
+    93: "Other - Hazardous category C",
+    94: "Other - Hazardous category D",
+    95: "Other - Reserved",
+    96: "Other - Reserved",
+    97: "Other - Reserved",
+    98: "Other - Reserved",
+    99: "Other - No additional information",
+}
+
+
+# Negara berdasarkan MID
+COUNTRY = {
+    # Eropa
+    "201": "Albania",
+    "202": "Andorra",
+    "203": "Austria",
+    "204": "Portugal (Azores)",
+    "205": "Belgium",
+    "206": "Belarus",
+    "207": "Bulgaria",
+    "208": "Vatican City",
+    "209": "Cyprus",
+    "210": "Cyprus",
+    "211": "Germany",
+    "212": "Cyprus",
+    "213": "Georgia",
+    "214": "Moldova",
+    "215": "Malta",
+    "216": "Armenia",
+    "218": "Germany",
+    "219": "Denmark",
+    "220": "Denmark",
+    "224": "Spain",
+    "226": "France",
+    "230": "Finland",
+    "231": "Faroe Islands",
+    "232": "United Kingdom",
+    "233": "United Kingdom",
+    "234": "United Kingdom",
+    "235": "United Kingdom",
+    "236": "Gibraltar",
+    "237": "Greece",
+    "238": "Croatia",
+    "239": "Greece",
+    "240": "Albania",
+    "241": "Netherlands",
+    "242": "Portugal",
+    "244": "Netherlands",
+    "246": "Belarus",
+    "248": "Croatia",
+    "250": "Ireland",
+    "251": "Iceland",
+    "255": "Malta",
+    "257": "Norway",
+    "259": "Norway",
+    "261": "Poland",
+    "263": "Portugal",
+    "266": "Romania",
+    "268": "Hungary",
+    "270": "Italy",
+    "271": "Slovenia",
+    "272": "San Marino",
+    "273": "Ukraine",
+    "274": "Czech Republic",
+    "276": "Slovakia",
+    "278": "Slovenia",
+    "280": "Switzerland",
+    "282": "Serbia",
+    "283": "Montenegro",
+
+    # Amerika Utara / Karibia
+    "300": "Virgin Islands",
+    "301": "Anguilla",
+    "302": "Antigua and Barbuda",
+    "303": "Bermuda",
+    "304": "Canada",
+    "305": "Canada",
+    "306": "Netherlands (Caribbean)",
+    "307": "Aruba",
+    "308": "Dominica",
+    "309": "Dominican Republic",
+    "310": "United States",
+    "311": "United States",
+    "312": "United States",
+    "316": "Canada",
+    "338": "United States",
+    "366": "United States",
+    "367": "United States",
+    "368": "United States",
+    "369": "United States",
+
+    # Amerika Tengah / Selatan
+    "350": "Chile",
+    "351": "Portugal",
+    "352": "Luxembourg",
+    "355": "Portugal (Madeira)",
+    "360": "Egypt",
+    "362": "Morocco",
+    "370": "Panama",
+    "371": "Panama",
+    "372": "Panama",
+    "373": "Panama",
+    "374": "Nicaragua",
+    "375": "Panama",
+    "380": "Colombia",
+    "385": "Barbados",
+    "387": "Barbados",
+    "400": "United Arab Emirates",
+
+    # Asia
+    "401": "Israel",
+    "402": "Lebanon",
+    "403": "Saudi Arabia",
+    "404": "Kuwait",
+    "405": "Pakistan",
+    "406": "Afghanistan",
+    "407": "Sri Lanka",
+    "408": "Bahrain",
+    "409": "Qatar",
+    "410": "Jordan",
+    "411": "Yemen",
+    "412": "China",
+    "413": "China",
+    "414": "China",
+    "415": "Mongolia",
+    "416": "Taiwan",
+    "417": "Sri Lanka",
+    "418": "Nepal",
+    "419": "India",
+    "420": "Turkey",
+    "430": "Japan",
+    "431": "Japan",
+    "432": "Japan",
+    "440": "South Korea",
+    "441": "South Korea",
+
+    # Asia Tenggara / Oseania
+    "450": "Bangladesh",
+    "455": "Maldives",
+    "457": "Myanmar",
+    "462": "Philippines",
+    "463": "Philippines",
+    "470": "Turkey",
+    "502": "Australia",
+    "503": "Australia",
+    "504": "New Zealand",
+    "505": "Papua New Guinea",
+    "506": "Fiji",
+    "507": "Solomon Islands",
+    "508": "Vanuatu",
+    "515": "Cambodia",
+    "520": "Marshall Islands",
+    "521": "Palau",
+    "525": "Indonesia",
+    "526": "Indonesia",
+    "533": "Malaysia",
+    "538": "Philippines",
+    "539": "Vietnam",
+    "563": "Singapore",
+    "566": "Malaysia",
+    "567": "Brunei",
+
+    # Afrika
+    "600": "South Africa",
+    "601": "Angola",
+    "602": "Benin",
+    "603": "Mauritius",
+    "604": "Morocco",
+    "605": "Algeria",
+    "606": "Madagascar",
+    "607": "St Paul & Amsterdam Is",
+    "609": "Burundi",
+    "610": "Benin",
+    "611": "Botswana",
+    "612": "Central African Republic",
+    "613": "Cameroon",
+    "618": "Reunion",
+    "619": "Djibouti",
+    "620": "Eritrea",
+    "621": "Ethiopia",
+    "622": "Gabon",
+    "624": "Ghana",
+    "626": "Guinea-Bissau",
+    "628": "Kenya",
+    "629": "Lesotho",
+    "630": "Liberia",
+    "634": "Mali",
+    "635": "Mozambique",
+    "636": "Namibia",
+    "637": "Niger",
+    "638": "Nigeria",
+    "639": "Rwanda",
+    "641": "Senegal",
+    "642": "Seychelles",
+    "643": "Sierra Leone",
+    "644": "Somalia",
+    "645": "South Africa",
+    "646": "Sudan",
+    "647": "Tanzania",
+    "648": "Togo",
+    "649": "Tunisia",
+
+    # Amerika Selatan
+    "700": "Argentina",
+    "710": "Chile",
+    "720": "Venezuela",
+    "730": "Panama",
+    "740": "Guyana",
+}
+
+
+# Cache fragment AIS
+ais_fragments = {}
+
+ais_fragments_lock = threading.Lock()
+
+
+# Koneksi database (connection pool)
+db_pool = None
+db_pool_lock = threading.Lock()
+
+
+def get_pool():
+    global db_pool
+
+    with db_pool_lock:
+        if db_pool is None:
+            db_pool = ThreadedConnectionPool(
+                1,
+                30,
+                host=DB_HOST,
+                port=DB_PORT,
+                dbname=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                connect_timeout=10
+            )
+
+        return db_pool
+
+
+def db_execute(sql, params=None, fetch=False):
+    # Jalankan satu query lalu commit
+    pool = get_pool()
+    conn = pool.getconn()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+
+            rows = cur.fetchall() if fetch else None
+
+        conn.commit()
+
+        return rows
+
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        raise
+
+    finally:
+        pool.putconn(conn, close=bool(conn.closed))
+
+
+def execute_with_retry(func, retries=5, delay=0.5):
+    last_error = None
+
+    for i in range(retries):
+        try:
+            return func()
+
+        except psycopg2.OperationalError as e:
+            last_error = e
+            time.sleep(delay * (i + 1))
+
+    print(f"[DB ERROR] Max retry reached: {last_error}")
+
+    return None
+
+
+# Fungsi bantu
+def now_utc():
+    return datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def clean_text(value):
+    # Bersihkan string AIS
+    if value is None:
+        return None
+
+    try:
+        value = str(value)
+    except Exception:
+        return None
+
+    value = value.replace("@", " ")
+    value = value.replace("\x00", "")
+    value = value.strip()
+
+    if not value:
+        return None
+
+    return value
+
+
+def clean_shipname(value):
+    value = clean_text(value)
+
+    if not value:
+        return None
+
+    value = value.replace("/", " ").strip()
+
+    if not value:
+        return None
+
+    return value
+
+
+def to_float(value, default=None):
+    try:
+        if value is None:
+            return default
+
+        return float(value)
+
+    except Exception:
+        return default
+
+
+def to_int(value, default=None):
+    try:
+        if value is None:
+            return default
+
+        return int(value)
+
+    except Exception:
+        return default
+
+
+def lookup_nav_status(code):
+    try:
+        return NAV_STATUS.get(
+            int(code),
+            "Unknown"
+        )
+    except Exception:
+        return "Unknown"
+
+
+def lookup_ship_type(code):
+    try:
+        return SHIP_TYPE.get(
+            int(code),
+            "Unknown"
+        )
+    except Exception:
+        return "Unknown"
+
+
+def lookup_country(mmsi):
+    try:
+        mid = str(mmsi)[:3]
+
+        return COUNTRY.get(
+            mid,
+            "UNKNOWN"
+        )
+
+    except Exception:
+        return "UNKNOWN"
+
+
+# Baca config sumber data
+def load_adsb_sources():
+    return [
+        s.strip()
+        for s in config.get(
+            "adsb",
+            "sources",
+            fallback=""
+        ).split(",")
+        if s.strip()
+    ]
+
+
+def load_radio_sources():
+    result = []
+
+    for s in config.get(
+        "radio",
+        "sources",
+        fallback=""
+    ).split(","):
+
+        s = s.strip()
+
+        if not s:
+            continue
+
+        if "|" in s:
+            try:
+                url, cred = s.split("|", 1)
+                username, password = cred.split(":", 1)
+
+                result.append(
+                    (
+                        url.strip(),
+                        username.strip(),
+                        password.strip()
+                    )
+                )
+
+            except Exception as e:
+                print(
+                    f"[RADIO CONFIG ERROR] "
+                    f"{s} -> {e}"
+                )
+
+        else:
+            result.append(
+                (
+                    s,
+                    None,
+                    None
+                )
+            )
+
+    return result
+
+
+def load_ais_sources():
+    result = []
+
+    if not config.has_section("ais"):
+        print(
+            "[AIS] Section [ais] "
+            "tidak ditemukan"
+        )
+
+        return result
+
+    for s in config.get(
+        "ais",
+        "sources",
+        fallback=""
+    ).split(","):
+
+        s = s.strip()
+
+        if not s:
+            continue
+
+        try:
+            ip, port = s.rsplit(":", 1)
+
+            result.append(
+                (
+                    ip.strip(),
+                    int(port.strip())
+                )
+            )
+
+        except Exception as e:
+            print(
+                f"[AIS CONFIG ERROR] "
+                f"{s} -> {e}"
+            )
+
+    return result
+
+
+# Buat tabel jika belum ada
+def ensure_database():
+
+    def _exec():
+        db_execute("""
+            CREATE TABLE IF NOT EXISTS ships (
+                id SERIAL PRIMARY KEY,
+                mmsi TEXT UNIQUE NOT NULL,
+                message_type INTEGER,
+                shipname TEXT,
+                ship_type TEXT,
+                nav_stat TEXT,
+                country TEXT,
+                destination TEXT,
+                lat DOUBLE PRECISION,
+                lon DOUBLE PRECISION,
+                speed DOUBLE PRECISION,
+                course DOUBLE PRECISION,
+                heading DOUBLE PRECISION,
+                callsign TEXT,
+                imo TEXT,
+                eta TEXT,
+                last_seen TIMESTAMP
+            )
+        """)
+
+        db_execute("""
+            CREATE TABLE IF NOT EXISTS flight (
+                id SERIAL PRIMARY KEY,
+                hex TEXT,
+                flight TEXT UNIQUE NOT NULL,
+                lat DOUBLE PRECISION,
+                lon DOUBLE PRECISION,
+                altitude DOUBLE PRECISION,
+                speed DOUBLE PRECISION,
+                track DOUBLE PRECISION,
+                vert_rate DOUBLE PRECISION,
+                squawk TEXT,
+                category TEXT,
+                messages INTEGER,
+                seen DOUBLE PRECISION,
+                seen_pos DOUBLE PRECISION,
+                rssi DOUBLE PRECISION,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db_execute("""
+            CREATE TABLE IF NOT EXISTS radio (
+                id SERIAL PRIMARY KEY,
+                address TEXT UNIQUE NOT NULL,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                speed DOUBLE PRECISION,
+                timestamp TIMESTAMP
+            )
+        """)
+
+    result = execute_with_retry(_exec)
+
+    return result
+
+
+# Parsing AIS
+def get_data_value(data, *names):
+    # Ambil field dari beberapa kemungkinan nama
+    for name in names:
+        if name in data:
+            value = data.get(name)
+
+            if value is not None:
+                return value
+
+    return None
+
+
+def parse_ais_sentence(sentence):
+    # Decode satu pesan AIS yang sudah lengkap
+    try:
+        if not sentence:
+            return None
+
+        sentence = sentence.strip()
+
+        if not sentence.startswith("!"):
+            return None
+
+        msg = decode(
+            sentence,
+            error_if_checksum_invalid=False
+        )
+
+        data = msg.asdict()
+
+        msg_type = to_int(
+            get_data_value(
+                data,
+                "msg_type",
+                "message_type"
+            )
+        )
+
+        if msg_type not in VALID_MSG_TYPES:
+            return None
+
+        mmsi = get_data_value(
+            data,
+            "mmsi"
+        )
+
+        if not mmsi:
+            return None
+
+        mmsi = str(mmsi)
+
+        # Posisi
+        lat = get_data_value(
+            data,
+            "lat",
+            "latitude"
+        )
+
+        lon = get_data_value(
+            data,
+            "lon",
+            "longitude"
+        )
+
+        speed = get_data_value(
+            data,
+            "speed",
+            "sog"
+        )
+
+        course = get_data_value(
+            data,
+            "course",
+            "cog"
+        )
+
+        heading = get_data_value(
+            data,
+            "heading",
+            "true_heading"
+        )
+
+        # Data statis
+        shipname = get_data_value(
+            data,
+            "shipname",
+            "ship_name",
+            "name"
+        )
+
+        callsign = get_data_value(
+            data,
+            "callsign",
+            "call_sign"
+        )
+
+        destination = get_data_value(
+            data,
+            "destination"
+        )
+
+        imo = get_data_value(
+            data,
+            "imo"
+        )
+
+        ship_type = get_data_value(
+            data,
+            "ship_type",
+            "shiptype"
+        )
+
+        status = get_data_value(
+            data,
+            "status",
+            "nav_status"
+        )
+
+        part = get_data_value(
+            data,
+            "part",
+            "part_number"
+        )
+
+        # Type 24: jangan hapus data hanya karena field tertentu None
+        if msg_type == 24:
+
+            if shipname is not None:
+                shipname = clean_shipname(shipname)
+
+            if callsign is not None:
+                callsign = clean_text(callsign)
+
+            if destination is not None:
+                destination = clean_text(destination)
+
+        else:
+
+            shipname = clean_shipname(shipname)
+            callsign = clean_text(callsign)
+            destination = clean_text(destination)
+
+        result = {
+            "mmsi": mmsi,
+            "message_type": msg_type,
+
+            "lat": to_float(lat),
+            "lon": to_float(lon),
+
+            "speed": to_float(speed),
+            "course": to_float(course),
+            "heading": to_float(heading),
+
+            "shipname": shipname,
+            "callsign": callsign,
+            "destination": destination,
+
+            "country": lookup_country(mmsi),
+
+            "imo": imo,
+            "ship_type": to_int(ship_type),
+            "status": to_int(status),
+
+            "part": part,
+
+            "last_seen": now_utc(),
+
+            "_raw": data,
+        }
+
+        return result
+
+    except Exception as e:
+        print(
+            f"[AIS PARSE ERROR] "
+            f"{sentence} -> {e}"
+        )
+
+        return None
+
+
+# Gabungkan fragment AIS
+def process_ais_line(line):
+
+    line = line.strip()
+
+    if not line:
+        return None
+
+    if not line.startswith("!"):
+        return None
+
+    try:
+        parts = line.split(",")
+
+        if len(parts) < 7:
+            return None
+
+        fragment_count = int(parts[1])
+        fragment_number = int(parts[2])
+        sequence_id = parts[3].strip()
+        channel = parts[4].strip()
+
+        # Pesan tunggal
+        if fragment_count == 1:
+            return parse_ais_sentence(line)
+
+        # Pesan multi fragment
+        if not sequence_id:
+            sequence_id = f"NOSEQ_{channel}"
+
+        key = (
+            f"{channel}:"
+            f"{sequence_id}"
+        )
+
+        now = time.time()
+
+        with ais_fragments_lock:
+
+            # Hapus fragment lama
+            expired = []
+
+            for k, item in ais_fragments.items():
+                if (
+                    now - item["time"]
+                    > FRAGMENT_TIMEOUT
+                ):
+                    expired.append(k)
+
+            for k in expired:
+                del ais_fragments[k]
+
+            if key not in ais_fragments:
+                ais_fragments[key] = {
+                    "time": now,
+                    "total": fragment_count,
+                    "parts": {}
+                }
+
+            item = ais_fragments[key]
+
+            item["time"] = now
+            item["total"] = fragment_count
+
+            item["parts"][fragment_number] = line
+
+            # Belum lengkap
+            if len(item["parts"]) < fragment_count:
+                return None
+
+            # Semua fragment sudah ada
+            complete_parts = []
+
+            for n in range(
+                1,
+                fragment_count + 1
+            ):
+
+                if n not in item["parts"]:
+                    return None
+
+                complete_parts.append(
+                    item["parts"][n]
+                )
+
+            del ais_fragments[key]
+
+        # Gabungkan payload jadi satu sentence baru
+        try:
+            first = complete_parts[0].split(",")
+
+            last = complete_parts[-1].split(",")
+
+            payloads = []
+
+            for p in complete_parts:
+                pparts = p.split(",")
+
+                if len(pparts) >= 7:
+                    payloads.append(
+                        pparts[5]
+                    )
+
+            combined_payload = "".join(
+                payloads
+            )
+
+            fill_bits = last[6]
+
+            prefix = first[0]
+
+            base = (
+                f"{prefix},1,1,,A,"
+                f"{combined_payload},"
+                f"{fill_bits}"
+            )
+
+            # Hitung checksum baru
+            checksum = 0
+
+            for char in base[1:]:
+                checksum ^= ord(char)
+
+            sentence = (
+                f"{base}*"
+                f"{checksum:02X}"
+            )
+
+            return parse_ais_sentence(
+                sentence
+            )
+
+        except Exception as e:
+            print(
+                f"[AIS FRAGMENT ERROR] "
+                f"{key} -> {e}"
+            )
+
+            return None
+
+    except Exception as e:
+        print(
+            f"[AIS LINE ERROR] "
+            f"{line} -> {e}"
+        )
+
+        return None
+
+
+# Simpan kapal ke ships (nilai None tidak menimpa data lama)
+def upsert_snapshot(info):
+
+    if not info:
+        return
+
+    mmsi = info.get("mmsi")
+
+    if not mmsi:
+        return
+
+    ship_type_code = info.get("ship_type")
+
+    ship_type = (
+        lookup_ship_type(ship_type_code)
+        if ship_type_code is not None
+        else None
+    )
+
+    status_code = info.get("status")
+
+    nav_stat = (
+        lookup_nav_status(status_code)
+        if status_code is not None
+        else None
+    )
+
+    country = info.get("country")
+
+    if country == "UNKNOWN":
+        country = None
+
+    imo = info.get("imo")
+
+    imo = str(imo) if imo else None
+
+    params = (
+        mmsi,
+        info.get("message_type"),
+        info.get("shipname"),
+        ship_type,
+        nav_stat,
+        country,
+        info.get("destination"),
+        info.get("lat"),
+        info.get("lon"),
+        info.get("speed"),
+        info.get("course"),
+        info.get("heading"),
+        info.get("callsign"),
+        imo,
+        info.get("last_seen"),
+    )
+
+    def _exec():
+        db_execute(
+            """
+            INSERT INTO ships (
+                mmsi,
+                message_type,
+                shipname,
+                ship_type,
+                nav_stat,
+                country,
+                destination,
+                lat,
+                lon,
+                speed,
+                course,
+                heading,
+                callsign,
+                imo,
+                last_seen
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (mmsi) DO UPDATE SET
+                message_type = COALESCE(EXCLUDED.message_type, ships.message_type),
+                shipname     = COALESCE(EXCLUDED.shipname, ships.shipname),
+                ship_type    = COALESCE(EXCLUDED.ship_type, ships.ship_type),
+                nav_stat     = COALESCE(EXCLUDED.nav_stat, ships.nav_stat),
+                country      = COALESCE(EXCLUDED.country, ships.country),
+                destination  = COALESCE(EXCLUDED.destination, ships.destination),
+                lat          = COALESCE(EXCLUDED.lat, ships.lat),
+                lon          = COALESCE(EXCLUDED.lon, ships.lon),
+                speed        = COALESCE(EXCLUDED.speed, ships.speed),
+                course       = COALESCE(EXCLUDED.course, ships.course),
+                heading      = COALESCE(EXCLUDED.heading, ships.heading),
+                callsign     = COALESCE(EXCLUDED.callsign, ships.callsign),
+                imo          = COALESCE(EXCLUDED.imo, ships.imo),
+                last_seen    = COALESCE(EXCLUDED.last_seen, ships.last_seen)
+            """,
+            params
+        )
+
+    execute_with_retry(_exec)
+
+
+# ADS-B
+def upsert_aircraft(data):
+
+    flight = data.get("flight")
+
+    if not flight:
+        return
+
+    params = (
+        data.get("hex"),
+        flight,
+        to_float(data.get("lat")),
+        to_float(data.get("lon")),
+        to_float(data.get("altitude")),
+        to_float(data.get("speed")),
+        to_float(data.get("track")),
+        to_float(data.get("vert_rate")),
+        data.get("squawk"),
+        data.get("category"),
+        to_int(data.get("messages")),
+        to_float(data.get("seen")),
+        to_float(data.get("seen_pos")),
+        to_float(data.get("rssi")),
+    )
+
+    def _exec():
+        db_execute(
+            """
+            INSERT INTO flight (
+                hex,
+                flight,
+                lat,
+                lon,
+                altitude,
+                speed,
+                track,
+                vert_rate,
+                squawk,
+                category,
+                messages,
+                seen,
+                seen_pos,
+                rssi,
+                timestamp
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
+                CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (flight) DO UPDATE SET
+                hex       = EXCLUDED.hex,
+                lat       = EXCLUDED.lat,
+                lon       = EXCLUDED.lon,
+                altitude  = EXCLUDED.altitude,
+                speed     = EXCLUDED.speed,
+                track     = EXCLUDED.track,
+                vert_rate = EXCLUDED.vert_rate,
+                squawk    = EXCLUDED.squawk,
+                category  = EXCLUDED.category,
+                messages  = EXCLUDED.messages,
+                seen      = EXCLUDED.seen,
+                seen_pos  = EXCLUDED.seen_pos,
+                rssi      = EXCLUDED.rssi,
+                timestamp = CURRENT_TIMESTAMP
+            """,
+            params
+        )
+
+    execute_with_retry(_exec)
+
+
+def adsb_worker(url):
+
+    while True:
+
+        try:
+
+            response = requests.get(
+                url,
+                timeout=3
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            aircraft = data.get(
+                "aircraft",
+                []
+            )
+
+            if not isinstance(
+                aircraft,
+                list
+            ):
+                time.sleep(1)
+                continue
+
+            for ac in aircraft:
+
+                if (
+                    isinstance(ac, dict)
+                    and ac.get("flight")
+                ):
+                    upsert_aircraft(ac)
+
+        except Exception as e:
+
+            print(
+                f"[ADSB ERROR] "
+                f"{url} {e}"
+            )
+
+        time.sleep(0.5)
+
+
+def adsb_loop():
+
+    while True:
+
+        for url in load_adsb_sources():
+
+            if url not in adsb_workers:
+
+                t = threading.Thread(
+                    target=adsb_worker,
+                    args=(url,),
+                    daemon=True
+                )
+
+                t.start()
+
+                adsb_workers[url] = t
+
+        time.sleep(5)
+
+
+# Radio
+def upsert_radio(data):
+
+    address = data.get("address")
+
+    if not address:
+        return
+
+    lat = to_float(
+        data.get("latitude"),
+        0.0
+    )
+
+    lon = to_float(
+        data.get("longitude"),
+        0.0
+    )
+
+    speed = to_float(
+        data.get("speed"),
+        0.0
+    )
+
+    ts = now_utc()
+
+    def _exec():
+        db_execute(
+            """
+            INSERT INTO radio (
+                address,
+                latitude,
+                longitude,
+                speed,
+                timestamp
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (address) DO UPDATE SET
+                latitude  = EXCLUDED.latitude,
+                longitude = EXCLUDED.longitude,
+                speed     = EXCLUDED.speed,
+                timestamp = EXCLUDED.timestamp
+            """,
+            (address, lat, lon, speed, ts)
+        )
+
+    try:
+        execute_with_retry(_exec)
+
+    except Exception as e:
+        print(
+            "[RADIO ERROR]",
+            e
+        )
+
+
+def radio_worker(
+    url,
+    username=None,
+    password=None
+):
+
+    while True:
+
+        try:
+
+            if username and password:
+
+                response = requests.get(
+                    url,
+                    auth=HTTPBasicAuth(
+                        username,
+                        password
+                    ),
+                    timeout=5,
+                    verify=False
+                )
+
+            else:
+
+                response = requests.get(
+                    url,
+                    timeout=5,
+                    verify=False
+                )
+
+            if response.status_code != 200:
+
+                print(
+                    f"[RADIO HTTP ERROR] "
+                    f"{url} "
+                    f"{response.status_code}"
+                )
+
+                time.sleep(2)
+                continue
+
+            data = response.json()
+
+            records = data.get(
+                "records",
+                []
+            )
+
+            if not isinstance(
+                records,
+                list
+            ):
+
+                print(
+                    "[RADIO FORMAT ERROR] "
+                    "records bukan list"
+                )
+
+                time.sleep(2)
+                continue
+
+            for record in records:
+
+                if isinstance(
+                    record,
+                    dict
+                ):
+                    upsert_radio(
+                        record
+                    )
+
+        except Exception as e:
+
+            print(
+                f"[RADIO ERROR] "
+                f"{url} {e}"
+            )
+
+        time.sleep(1)
+
+
+def radio_loop():
+
+    while True:
+
+        for (
+            url,
+            username,
+            password
+        ) in load_radio_sources():
+
+            key = (
+                f"{url}|"
+                f"{username}"
+            )
+
+            if key not in radio_workers:
+
+                t = threading.Thread(
+                    target=radio_worker,
+                    args=(
+                        url,
+                        username,
+                        password
+                    ),
+                    daemon=True
+                )
+
+                t.start()
+
+                radio_workers[key] = t
+
+        time.sleep(5)
+
+
+# AIS TCP worker
+def tcp_worker(ip, port):
+
+    while True:
+
+        client = None
+
+        try:
+
+            client = socket.socket(
+                socket.AF_INET,
+                socket.SOCK_STREAM
+            )
+
+            client.settimeout(
+                SOCKET_RECV_TIMEOUT
+            )
+
+            client.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_KEEPALIVE,
+                1
+            )
+
+            client.connect(
+                (ip, port)
+            )
+
+            print(
+                f"[AIS CONNECTED] "
+                f"{ip}:{port}"
+            )
+
+            buffer = ""
+
+            while True:
+
+                try:
+
+                    chunk = client.recv(
+                        BUFFER_SIZE
+                    )
+
+                except socket.timeout:
+                    continue
+
+                if not chunk:
+
+                    print(
+                        f"[AIS DISCONNECTED] "
+                        f"{ip}:{port}"
+                    )
+
+                    break
+
+                buffer += chunk.decode(
+                    "ascii",
+                    errors="ignore"
+                )
+
+                # Proses per baris
+                while "\n" in buffer:
+
+                    line, buffer = (
+                        buffer.split(
+                            "\n",
+                            1
+                        )
+                    )
+
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    if (
+                        line.startswith(
+                            "!AIVDM"
+                        )
+                        or line.startswith(
+                            "!AIVDO"
+                        )
+                    ):
+
+                        info = process_ais_line(
+                            line
+                        )
+
+                        if info:
+
+                            # Debug pesan statis
+                            if (
+                                info.get(
+                                    "message_type"
+                                )
+                                in STATIC_MSG_TYPES
+                            ):
+
+                                print(
+                                    "[AIS STATIC]",
+                                    info.get(
+                                        "message_type"
+                                    ),
+                                    info.get(
+                                        "mmsi"
+                                    ),
+                                    repr(
+                                        info.get(
+                                            "shipname"
+                                        )
+                                    ),
+                                    repr(
+                                        info.get(
+                                            "callsign"
+                                        )
+                                    )
+                                )
+
+                            upsert_snapshot(info)
+
+        except Exception as e:
+
+            print(
+                f"[AIS ERROR] "
+                f"{ip}:{port} "
+                f"{e}"
+            )
+
+        finally:
+
+            if client:
+
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        time.sleep(5)
+
+
+def fetch_ais_loop():
+
+    while True:
+
+        for (
+            ip,
+            port
+        ) in load_ais_sources():
+
+            key = (
+                f"{ip}:{port}"
+            )
+
+            if key not in ais_workers:
+
+                t = threading.Thread(
+                    target=tcp_worker,
+                    args=(
+                        ip,
+                        port
+                    ),
+                    daemon=True
+                )
+
+                t.start()
+
+                ais_workers[key] = t
+
+                print(
+                    f"[AIS] "
+                    f"Worker started "
+                    f"{key}"
+                )
+
+        time.sleep(5)
+
+
+# Endpoint debug
+@app.route("/ais")
+def ais_status():
+
+    def _exec():
+
+        return db_execute(
+            """
+            SELECT
+                mmsi,
+                message_type,
+                shipname,
+                ship_type,
+                nav_stat,
+                country,
+                destination,
+                lat,
+                lon,
+                speed,
+                course,
+                heading,
+                callsign,
+                imo,
+                last_seen
+            FROM ships
+            ORDER BY last_seen DESC NULLS LAST
+            LIMIT 100
+            """,
+            fetch=True
+        )
+
+    rows = execute_with_retry(
+        _exec
+    )
+
+    result = []
+
+    for row in rows or []:
+
+        result.append(
+            {
+                "mmsi": row[0],
+                "message_type": row[1],
+                "shipname": row[2],
+                "ship_type": row[3],
+                "nav_stat": row[4],
+                "country": row[5],
+                "destination": row[6],
+                "lat": row[7],
+                "lon": row[8],
+                "speed": row[9],
+                "course": row[10],
+                "heading": row[11],
+                "callsign": row[12],
+                "imo": row[13],
+                "last_seen": (
+                    row[14].strftime("%Y-%m-%d %H:%M:%S")
+                    if row[14]
+                    else None
+                ),
+            }
+        )
+
+    return result
+
+
+@app.route("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "time": now_utc(),
+        "ais_workers": len(ais_workers),
+        "adsb_workers": len(adsb_workers),
+        "radio_workers": len(radio_workers),
+    }
+
+
+# Main
+if __name__ == "__main__":
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        " AIS / ADS-B / RADIO COLLECTOR"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        f"[CONFIG] {CONFIG_PATH}"
+    )
+
+    print(
+        f"[DATABASE] postgresql://{DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    )
+
+    ensure_database()
+
+    threading.Thread(
+        target=adsb_loop,
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=radio_loop,
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=fetch_ais_loop,
+        daemon=True
+    ).start()
+
+    print(
+        "[SYSTEM] All workers started"
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=5001,
+        threaded=True
+    )
